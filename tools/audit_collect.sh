@@ -1,78 +1,83 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env sh
+set -euf
 
-REPO="${REPO:-polyamine-swcnt-transport-summer2025}"
-ROOT="${PWD}"
-OUT="$ROOT/$REPO"
-MAN="$OUT/results/AUDIT_MANIFEST.tsv"
-LOG="$OUT/results/AUDIT_LOG.txt"
-mkdir -p "$OUT/results"
+# Require ripgrep
+if ! command -v rg >/dev/null 2>&1; then
+  echo "ripgrep (rg) not found. Install with: brew install ripgrep"
+  exit 1
+fi
 
-echo -e "REL_PATH\tORIG_ABS\tBYTES\tSHA256" > "$MAN"
+REPO_ROOT="$(pwd)"
+OUT="$REPO_ROOT"
+LOG="$REPO_ROOT/results/AUDIT_LOG.txt"
+MAN="$REPO_ROOT/results/AUDIT_MANIFEST.tsv"
+TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+mkdir -p results figures/{gnuplot,exports} data/processed sim/{inputs,params,topology,jobs} scripts/{plotting,analysis}
 
-copy_strip() {
-  src="$1"; dest="$2"
-  mkdir -p "$(dirname "$dest")"
-  cp -p "$src" "$dest"
-  "$OUT/tools/strip_comments.py" "$dest" || true
-  printf "%s\t%s\t%s\t%s\n" \
-    "$(realpath --relative-to="$OUT" "$dest" 2>/dev/null || python3 - <<PY
-import os,sys;print(os.path.relpath("$dest","$OUT"))
-PY
-)" \
-    "$(realpath "$src" 2>/dev/null || python3 - <<PY
-import os,sys;print(os.path.abspath("$src"))
-PY
-)" \
-    "$(stat -f %z "$dest" 2>/dev/null || stat -c %s "$dest")" \
-    "$(sha "$dest")" >> "$MAN"
+echo "=== AUDIT START $TS ===" | tee "$LOG"
+echo "path	sha256" > "$MAN"
+
+# Scope: default only this repo. To broaden later:
+#   SEARCH_ROOTS="$HOME/Desktop $HOME/Documents $PWD" sh tools/audit_collect.sh
+SEARCH_ROOTS="${SEARCH_ROOTS:-$REPO_ROOT}"
+
+copy_strip () {
+  src="$1"; dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  # copy
+  rsync -a "$src" "$dst" 2>>"$LOG" || cp -p "$src" "$dst"
+  # strip comments (keeps .orig beside)
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$REPO_ROOT/tools/strip_comments.py" "$dst" 2>>"$LOG" || true
+  fi
+  # checksum
+  if command -v shasum >/dev/null 2>&1; then
+    sum="$(shasum -a 256 "$dst" | awk '{print $1}')"
+  else
+    sum="$(md5 -q "$dst" 2>/dev/null || echo NA)"
+  fi
+  printf "%s\t%s\n" "${dst#$REPO_ROOT/}" "$sum" >> "$MAN"
+  echo "OK  $dst" >> "$LOG"
 }
 
-# 1) Gnuplot & plotting scripts
-mapfile -t GP < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S -t \
-    -e 'set term.*pngcairo|set multiplot|plot .* using' -e '\.gnu$|\.gp$|\.gpl$' \
-    -l / 2>/dev/null || true)
-for f in "${GP[@]}"; do copy_strip "$f" "$OUT/figures/gnuplot/$(basename "$f")"; done
+# Helper: run ripgrep and stream NUL-delimited results through a loop
+rg_list () {
+  # args: pattern(s)
+  # shellcheck disable=SC2068
+  rg -0 -n --no-messages -S -l $@ $SEARCH_ROOTS 2>/dev/null || true
+}
 
-# 2) CSV/processed data used in figures
-mapfile -t CSV < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S \
-    -e 'signature_vectors\.csv|occ_summary.*\.csv|dndv.*\.csv|spearman.*\.csv|heatmap.*\.csv' \
-    -l / 2>/dev/null || true)
-for f in "${CSV[@]}"; do copy_strip "$f" "$OUT/data/processed/$(basename "$f")"; done
+# 1) Gnuplot & plotting scripts + figure assets
+rg_list '\.(gnu|gp|gpl)$' 'signature_vectors\.csv' 'fig.*\.(png|svg)$' | \
+while IFS= read -r -d '' f; do
+  case "$f" in
+    *.gnu|*.gp|*.gpl)    dst="figures/gnuplot/$(basename "$f")" ;;
+    *.png|*.svg)         dst="figures/exports/$(basename "$f")" ;;
+    *.csv|*.tsv|*.dat)   dst="data/processed/$(basename "$f")" ;;
+    *)                   dst="scripts/plotting/$(basename "$f")" ;;
+  esac
+  copy_strip "$f" "$OUT/$dst"
+done
 
-# 3) RDF outputs
-mapfile -t RDF < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S \
-    -e 'rdf.*\.(dat|xvg)$' -l / 2>/dev/null || true)
-for f in "${RDF[@]}"; do copy_strip "$f" "$OUT/data/processed/rdf/$(basename "$f")"; done
+# 2) Data files used in analysis
+rg_list '\.(csv|tsv|dat|json)$' 'signature_vectors\.csv|dn[_-]?dv|rdf|spearman|box.*whisker|heatmap' | \
+while IFS= read -r -d '' f; do
+  copy_strip "$f" "$OUT/data/processed/$(basename "$f")"
+done
 
-# 4) Analysis scripts (py/R/sh)
-mapfile -t ANA < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S \
-    -e 'spearman|glm|valence|box.*whisker|residence|r_over_R|occ|dndv' \
-    -e '\.py$|\.R$|\.r$|\.sh$|\.bash$' -l / 2>/dev/null || true)
-for f in "${ANA[@]}"; do copy_strip "$f" "$OUT/scripts/analysis/$(basename "$f")"; done
-
-# 5) Simulation inputs/params/topology/jobs
-mapfile -t SIM < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S \
-    -e 'cnt[135]|spermine|spermidine|putrescine|ethylamine|kcl|ions|water|gromacs|lammps' \
-    -e '\.pdb$|\.gro$|\.top$|\.itp$|\.prm$|\.psf$|\.rtp$|\.ndx$|\.mdp$|\.in$|\.slurm$|\.sbatch$|\.sh$' \
-    -l / 2>/dev/null || true)
-for f in "${SIM[@]}"; do
+# 3) Simulation inputs/topology/params/jobs
+rg_list 'cnt[135]|spermine|spermidine|putrescine|ethylamine|kcl|ions|water|gromacs|lammps' '\.(pdb|gro|top|itp|prm|psf|rtp|ndx|mdp|in|slurm|sbatch|sh)$' | \
+while IFS= read -r -d '' f; do
   case "$f" in
     *.pdb|*.gro) sub="inputs" ;;
     *.top|*.itp|*.prm|*.psf|*.rtp|*.ndx) sub="topology" ;;
     *.mdp|*.in)  sub="params" ;;
-    *.slurm|*.sbatch|*run_*.sh) sub="jobs" ;;
+    *.slurm|*.sbatch|*run_*.sh|*.sh) sub="jobs" ;;
     *) sub="inputs" ;;
   esac
   copy_strip "$f" "$OUT/sim/$sub/$(basename "$f")"
 done
-
-# 6) Figure exports (optional grab)
-mapfile -t PNG < <(rg -i -g '!'"$REPO"'/**' -n --no-messages -S \
-    -e 'fig.*\.(png|svg)$' -l / 2>/dev/null || true)
-for f in "${PNG[@]}"; do copy_strip "$f" "$OUT/figures/exports/$(basename "$f")"; done
 
 echo "=== AUDIT COMPLETE ===" | tee -a "$LOG"
 echo "Manifest: $MAN" | tee -a "$LOG"
