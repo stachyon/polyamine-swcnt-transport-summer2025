@@ -1,0 +1,5 @@
+=== AUDIT START 2025-09-13T08:38:53Z ===
+OK  /Users/mattiaamato/polyamine-swcnt-transport-summer2025/sim/inputs/README.md
+OK  /Users/mattiaamato/polyamine-swcnt-transport-summer2025/sim/jobs/audit_collect.sh
+=== AUDIT COMPLETE ===
+Manifest: /Users/mattiaamato/polyamine-swcnt-transport-summer2025/results/AUDIT_MANIFEST.tsv
